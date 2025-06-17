@@ -45,11 +45,15 @@ import psutil
 import functools
 import contextlib
 import inspect
+import asyncio
+import nest_asyncio
 from functools import partial
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
 from .dataset_utils import _get_vocab_size
 global LORA_REQUEST_ID
+
+nest_asyncio.apply()
 
 # Ignore logging messages
 import logging
@@ -419,6 +423,7 @@ def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1" # This is needed or else some Thread will die
     if debug:
         os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
     # os.environ["VLLM_TRACE_FUNCTION"] = "1"
@@ -466,32 +471,138 @@ def vllm_dynamic_quant_supported(
     return True
 pass
 
+import asyncio
+
+async def async_call(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+async def retrieve_bnb_state_and_offsets(llm):
+    is_async = "async" in llm.__class__.__name__.lower()
+    if is_async:
+        vllm_config = await llm.get_vllm_config()
+    else:
+        vllm_config = llm.get_vllm_config()
+    pipeline_parallel_size = vllm_config.parallel_config.pipeline_parallel_size
+
+    if pipeline_parallel_size == 1:
+        if is_async:
+            # Case 1: Async engine with no pipeline parallelism.
+            print("Mode: Async, pp_size=1. Awaiting RPC calls directly.")
+            results = await llm.collective_rpc("get_bnb_quant_state_and_offsets", args=tuple())
+        else:
+            # Case 2: Sync engine with no pipeline parallelism.
+            print("Mode: Sync, pp_size=1. Calling RPC methods directly.")
+            results = llm.collective_rpc("get_bnb_quant_state_and_offsets", args=tuple())
+    
+    elif pipeline_parallel_size > 1:
+        if is_async:
+            # Case 3: Async engine with pipeline parallelism.
+            print("Mode: Async, pp_size>1. Using async_call with the underlying sync engine.")
+            results = await async_call(llm.engine.collective_rpc, "get_bnb_quant_state_and_offsets", args=tuple())
+        else:
+            # Case 4: Sync engine with pipeline parallelism.
+            print("Mode: Sync, pp_size>1. This is not supported.")
+            raise ValueError(
+                "Pipeline parallelism > 1 is not supported in synchronous vLLM mode. "
+                "Please use the AsyncLLMEngine."
+            )
+    else:
+        raise ValueError(f"Invalid pipeline_parallel_size: {pipeline_parallel_size}")
+    
+    # Debug: print what we actually got
+    print(f"collective_rpc returned: {type(results)} - {results}")
+    
+    # Handle the case where collective_rpc returns a list of results from multiple workers
+    if isinstance(results, list):
+        # Merge results from all workers
+        merged_quant_state = {}
+        merged_offsets = {}
+        
+        for worker_result in results:
+            if isinstance(worker_result, dict):
+                merged_quant_state.update(worker_result.get("quant_state", {}))
+                merged_offsets.update(worker_result.get("offsets", {}))
+        
+        return {
+            "quant_state": merged_quant_state,
+            "offsets": merged_offsets
+        }
+    elif isinstance(results, dict):
+        # Single worker case
+        return results
+    else:
+        raise ValueError(f"Unexpected results type from collective_rpc: {type(results)}")
+
+
+async def retrieve_gpu_ids_and_all_weights(llm):
+    is_async = "async" in llm.__class__.__name__.lower()
+    if is_async:
+        vllm_config = await llm.get_vllm_config()
+    else:
+        vllm_config = llm.get_vllm_config()
+    pipeline_parallel_size = vllm_config.parallel_config.pipeline_parallel_size
+
+    if pipeline_parallel_size == 1:
+        if is_async:
+            # Case 1: Async engine with no pipeline parallelism.
+            # We can directly await the collective_rpc calls.
+            print("Mode: Async, pp_size=1. Awaiting RPC calls directly.")
+            gpu_ids, all_weights = await asyncio.gather(
+                llm.collective_rpc("report_device_id", args=tuple()),
+                llm.collective_rpc("get_weight_ipc_handles", args=tuple())
+            )
+        else:
+            # Case 2: Sync engine with no pipeline parallelism.
+            # We call the methods directly.
+            print("Mode: Sync, pp_size=1. Calling RPC methods directly.")
+            gpu_ids = llm.collective_rpc("report_device_id", args=tuple())
+            all_weights = llm.collective_rpc("get_weight_ipc_handles", args=tuple())
+
+    elif pipeline_parallel_size > 1:
+        if is_async:
+            # Case 3: Async engine with pipeline parallelism.
+            # The async LLM engine has a synchronous `engine` attribute for these calls.
+            # We must run these blocking calls in a thread pool to not block the event loop.
+            print("Mode: Async, pp_size>1. Using async_call with the underlying sync engine.")
+            gpu_ids, all_weights = await asyncio.gather(
+                async_call(llm.engine.collective_rpc, "report_device_id", args=tuple()),
+                async_call(llm.engine.collective_rpc, "get_weight_ipc_handles", args=tuple())
+            )
+        else:
+            # Case 4: Sync engine with pipeline parallelism.
+            # This is not a supported scenario in vLLM and should raise an error.
+            print("Mode: Sync, pp_size>1. This is not supported.")
+            raise ValueError(
+                "Pipeline parallelism > 1 is not supported in synchronous vLLM mode. "
+                "Please use the AsyncLLMEngine."
+            )
+            
+    else:
+        raise ValueError(f"Invalid pipeline_parallel_size: {pipeline_parallel_size}")
+
+    return gpu_ids, all_weights
+
+
+def get_state_dict_from_collective_rpc(gpu_ids, all_weights):
+    state_dict = {}
+
+    for i, (gpu_id, current_gpu_weights) in enumerate(zip(gpu_ids, all_weights)):
+        weights = current_gpu_weights[gpu_id]
+        for weight_name, (to_cuda_fx, cuda_data,) in weights.items():
+            state_dict[weight_name] = to_cuda_fx(*cuda_data[:-1], False)
+        pass
+
+    return state_dict
 
 @torch.inference_mode
 def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
-    # vllm_state_dict = {}
-    try:
-        llm_engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
-        vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
-
-        # for name, p in vllm_internals.named_parameters():
-        #     vllm_state_dict[name] = p
-    except:
-        # Using a new VLLM version must use collective_rpc
-        try:
-            vllm_state_dict = {}
-            gpu_ids = llm.collective_rpc("report_device_id", args = tuple())
-            weights = llm.collective_rpc("get_weight_ipc_handles", args = tuple())[0]
-            weights = weights[gpu_ids[0]]
-            for weight_name, (to_cuda_fx, cuda_data,) in weights.items():
-                vllm_state_dict[weight_name] = to_cuda_fx(*cuda_data)
-            pass
-            raise NotImplementedError("Unsloth: Currently vLLM RPC is not yet fully enabled!")
-        except Exception as e:
-            raise RuntimeError(f"Unsloth: Cannot get internal vLLM states with error = {str(e)}")
-    pass
+    gpu_ids, all_weights = asyncio.run(retrieve_gpu_ids_and_all_weights(llm))
+    bnb = asyncio.run(retrieve_bnb_state_and_offsets(llm))
+    bnb_state = bnb["quant_state"]
+    bnb_offsets = bnb["offsets"]
+    vllm_state_dict = get_state_dict_from_collective_rpc(gpu_ids, all_weights)
 
     assert(config is not None)
     vocab_size = _get_vocab_size(config)
@@ -499,19 +610,20 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    def get_state_dict(prefix, kk, state_dict, proj):
-        proj = getattr(proj, "base_layer", proj)
-        qweight = proj.weight
-        if hasattr(proj, "output_sizes"):
-            dim_offsets = np.cumsum([0] + proj.output_sizes)
-        else:
-            dim_offsets = [0, qweight.shape[0]]
-        pass
+    def get_state_dict(prefix, kk, state_dict, proj_name):
+        proj = vllm_state_dict.get(f"{proj_name}.base_layer.weight", state_dict.get(f"{proj_name}.weight", None))
+        qweight = proj
+        # if hasattr(proj, "output_sizes"):
+        #     dim_offsets = np.cumsum([0] + proj.output_sizes)
+        # else:
+        #     dim_offsets = [0, qweight.shape[0]]
+        # pass
+        dim_offsets = [0, qweight.shape[0]]  # vLLM does not use output_sizes
 
-        if hasattr(qweight, "bnb_quant_state"):
+        if proj_name in bnb_state:
             # Bitsandbytes quantizations
-            quant_states = qweight.bnb_quant_state
-            offsets = qweight.bnb_shard_offsets
+            quant_states = bnb_state[proj_name]
+            offsets = bnb_offsets[proj_name]
             state_dict[prefix + ".weight"] = qweight[offsets[kk] : offsets[kk + 1]]
             quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
             quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
@@ -527,7 +639,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         pass
 
         # Check bias
-        bias = getattr(proj, "bias", None)
+        bias = state_dict.get(f"{proj_name}.base_layer.bias", state_dict.get(f"{proj_name}.bias", None))
         if bias is not None:
             bias.requires_grad_(False) # Disable grad - sometimes vLLM forgets
             state_dict[prefix + ".bias"] = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
@@ -535,9 +647,46 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         pass
     pass
 
+
+    # def get_state_dict(prefix, kk, state_dict, proj):
+    #     proj = getattr(proj, "base_layer", proj)
+    #     qweight = proj.weight
+    #     if hasattr(proj, "output_sizes"):
+    #         dim_offsets = np.cumsum([0] + proj.output_sizes)
+    #     else:
+    #         dim_offsets = [0, qweight.shape[0]]
+    #     pass
+
+    #     if hasattr(qweight, "bnb_quant_state"):
+    #         # Bitsandbytes quantizations
+    #         quant_states = qweight.bnb_quant_state
+    #         offsets = qweight.bnb_shard_offsets
+    #         state_dict[prefix + ".weight"] = qweight[offsets[kk] : offsets[kk + 1]]
+    #         quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
+    #         quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
+    #         quant_state = quant_states[kk].as_dict(packed = True)
+    #         for k, v in quant_state.items():
+    #             state_dict[prefix + ".weight." + k] = v
+    #         pass
+    #     else:
+    #         # Normal FP16 weights
+    #         qweight.requires_grad_(False) # Disable grad - sometimes vLLM forgets
+    #         state_dict[prefix + ".weight"] = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
+    #         quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
+    #     pass
+
+    #     # Check bias
+    #     bias = getattr(proj, "bias", None)
+    #     if bias is not None:
+    #         bias.requires_grad_(False) # Disable grad - sometimes vLLM forgets
+    #         state_dict[prefix + ".bias"] = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
+    #         quant_state_dict[prefix + ".bias"] = state_dict[prefix + ".bias"]
+    #     pass
+    # pass
+
     # Embedding
-    embed_tokens = vllm_internals.model.embed_tokens
-    embed_tokens = getattr(embed_tokens, "base_layer", embed_tokens).weight.data
+    print(f"{vllm_state_dict = }")
+    embed_tokens = vllm_state_dict.get("model.embed_tokens.base_layer.weight", vllm_state_dict.get("model.embed_tokens.weight", None)).data
 
     # Counteract vLLM padding vocabs for LoRA
     if vocab_size is not None: embed_tokens = embed_tokens[:vocab_size]
@@ -546,21 +695,29 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
 
     # All layers
     skipped_layernorms = []
-    for kk in range(len(vllm_internals.model.layers)):
-        proj = vllm_internals.model.layers[kk].self_attn.qkv_proj
-        get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj)
-        get_state_dict(f"model.layers.{kk}.self_attn.k_proj", 1, state_dict, proj)
-        get_state_dict(f"model.layers.{kk}.self_attn.v_proj", 2, state_dict, proj)
 
-        proj = vllm_internals.model.layers[kk].self_attn.o_proj
-        get_state_dict(f"model.layers.{kk}.self_attn.o_proj", 0, state_dict, proj)
+    is_async = "async" in llm.__class__.__name__.lower()
+    if is_async:
+        vllm_config = asyncio.run(llm.get_vllm_config())
+    else:
+        vllm_config = llm.get_vllm_config()
 
-        proj = vllm_internals.model.layers[kk].mlp.gate_up_proj
-        get_state_dict(f"model.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-        get_state_dict(f"model.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+    num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    for kk in range(num_layers):
+        proj_name = f"model.layers.{kk}.self_attn.qkv_proj"
+        get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj_name)
+        get_state_dict(f"model.layers.{kk}.self_attn.k_proj", 1, state_dict, proj_name)
+        get_state_dict(f"model.layers.{kk}.self_attn.v_proj", 2, state_dict, proj_name)
 
-        proj = vllm_internals.model.layers[kk].mlp.down_proj
-        get_state_dict(f"model.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+        proj_name = f"model.layers.{kk}.self_attn.o_proj"
+        get_state_dict(f"model.layers.{kk}.self_attn.o_proj", 0, state_dict, proj_name)
+
+        proj_name = f"model.layers.{kk}.mlp.gate_up_proj"
+        get_state_dict(f"model.layers.{kk}.mlp.gate_proj", 0, state_dict, proj_name)
+        get_state_dict(f"model.layers.{kk}.mlp.up_proj",   1, state_dict, proj_name)
+
+        proj_name = f"model.layers.{kk}.mlp.down_proj"
+        get_state_dict(f"model.layers.{kk}.mlp.down_proj", 0, state_dict, proj_name)
 
         for layernorm_name in [
             f"model.layers.{kk}.input_layernorm",
@@ -570,10 +727,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
             f"model.layers.{kk}.self_attn.q_norm", # Qwen3, Gemma3
             f"model.layers.{kk}.self_attn.k_norm", # Qwen3, Gemma3
         ]:
-            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].")
-            vllm_name = f"vllm_internals.{vllm_name}"
             try:
-                layernorm = eval(vllm_name).state_dict()["weight"]
+                layernorm = vllm_state_dict[f"{layernorm_name}.weight"]
                 layernorm_name = layernorm_name + ".weight"
                 state_dict[layernorm_name] = layernorm
                 quant_state_dict[layernorm_name] = state_dict[layernorm_name]
@@ -583,13 +738,12 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     pass
 
     # Norm
-    state_dict["model.norm.weight"] = vllm_internals.model.norm.weight.data
+    state_dict["model.norm.weight"] = vllm_state_dict["model.norm.weight"]
     quant_state_dict["model.norm.weight"] = state_dict["model.norm.weight"]
 
     # LM Head
     if getattr(config, "tie_word_embeddings", True) is False:
-        lm_head = vllm_internals.lm_head
-        lm_head = getattr(lm_head, "base_layer", lm_head).weight.data
+        lm_head = vllm_state_dict.get("lm_head.base_layer.weight", vllm_state_dict["lm_head.weight"]).data
 
         # Counteract vLLM padding vocabs for LoRA
         if vocab_size is not None: lm_head = lm_head[:vocab_size]
@@ -949,6 +1103,7 @@ def load_vllm(
     disable_log_stats      : bool = False,
     enforce_eager          : bool = False, # Good for debugging
     enable_prefix_caching  : bool = True,
+    pipeline_parallel_size : int  = 1,
     compilation_config     : int  = 3, # -O3 for maximum performance
     conservativeness       : float = 1.0, # For low VRAM devices, scale batches, num_seqs
     max_logprobs           : int  = 0,
@@ -1169,9 +1324,10 @@ def load_vllm(
         compilation_config     = compilation_config, # 0, 1, 2, 3
         enforce_eager          = enforce_eager,
         swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
-        device                 = device,
+        # device                 = device,
         # New vLLM versions need to pass this in!
-        # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
+        worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
+        pipeline_parallel_size = pipeline_parallel_size, # Default is 1
     )
     good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
     old_keys = engine_args.keys()

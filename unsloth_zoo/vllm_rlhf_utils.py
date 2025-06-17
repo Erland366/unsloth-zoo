@@ -113,11 +113,15 @@ class ColocateWorkerExtension:
         torch.cuda.synchronize()
 
     def get_model_runner(self):
+        from vllm.model_executor.models.utils import PPMissingLayer
+
         vllm_model = self.model_runner.model
         model_loras_A, model_loras_B = [], []
         vllm_loras_A,  vllm_loras_B  = [], []
         parameters = []
         for v_layer in vllm_model.model.layers:
+            if isinstance(v_layer, PPMissingLayer):
+                continue
             print(v_layer.self_attn.qkv_proj.lora_a_stacked[0])
             vllm_loras_A .append(v_layer.self_attn.qkv_proj.lora_a_stacked[0])
             vllm_loras_A .append(v_layer.self_attn.qkv_proj.lora_a_stacked[1])
@@ -148,3 +152,19 @@ class ColocateWorkerExtension:
             # the full weights.
             data[name] = reduce_tensor(p.detach())
         return {self.device_uuid: data}
+
+    def get_bnb_quant_state_and_offsets(self):
+        results = {}
+        quant_state = {}
+        offsets = {}
+        vllm_model = self.model_runner.model
+        for name, module in vllm_model.named_modules():
+            if hasattr(module, "weight") and hasattr(module.weight, "bnb_quant_state"):
+                # TODO: This saves both the base layer and non base layer version
+                quant_state[name] = module.weight.bnb_quant_state
+                offsets[name] = module.weight.bnb_shard_offsets
+
+        results["quant_state"] = quant_state
+        results["offsets"] = offsets
+        print(results)
+        return results
