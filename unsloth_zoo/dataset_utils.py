@@ -340,14 +340,14 @@ def train_on_responses_only(
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
     pass
     
-    if hasattr(trainer, "eval_dataset")  and trainer.eval_dataset  is not None:
+    if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
         # Eval datasets could be a dict!
         if type(trainer.eval_dataset) is dict:
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-                if isinstance(trainer.eval_dataset, IterableDataset):
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
+                if isinstance(value, IterableDataset):
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
         else:
@@ -610,18 +610,6 @@ def sft_prepare_dataset(
     pass
     return dataset
 pass
-
-def _get_vocab_size(config):
-    """
-    Safely get vocab_size from config, handling both old and new config structures.
-    New configs may have vocab_size in text_config.
-    """
-    if hasattr(config, 'vocab_size'):
-        return config.vocab_size
-    elif hasattr(config, 'text_config') and hasattr(config.text_config, 'vocab_size'):
-        return config.text_config.vocab_size
-    else:
-        raise AttributeError("Could not find vocab_size in config or text_config")
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
