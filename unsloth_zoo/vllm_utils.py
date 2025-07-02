@@ -28,6 +28,7 @@ __all__ = [
     "generate_batches",
     "convert_lora_modules",
     "return_lora_modules",
+    "apply_sync_wrapper_patch"
 ]
 
 from typing import Optional, List, Tuple, Dict, Any
@@ -47,7 +48,10 @@ import contextlib
 import inspect
 import asyncio
 import nest_asyncio
+import uuid
+from types import MethodType
 from functools import partial
+from packaging.version import parse
 from .utils import _get_dtype
 from .patching_utils import patch_model_and_tokenizer
 global LORA_REQUEST_ID
@@ -65,7 +69,38 @@ def _return_nothing(*args, **kwargs): return None
 def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
+def get_offsets_tensor(offsets):
+    """
+    This function checks the format of the vLLM offsets and returns a torch.Tensor.
+
+    In older versions of vLLM (<=0.9.0), the 'offsets' variable was a direct torch.Tensor for pipeline paralel.
+    However, in newer versions, the structure was changed to a list-like object
+    containing the data type, shape, and memory address.
+
+    But one GPU behavior still stays the same across versions
+    """
+    if isinstance(offsets, torch.Tensor):
+        # If offsets is already a tensor, it's the old format.
+        # No further processing is needed.
+        return offsets
+    elif isinstance(offsets, (list, tuple)) and len(offsets) == 3:
+        # If offsets is a list or tuple with three elements, it is likely the new format.
+        # The elements are expected to be: [dtype_str, shape_list, memory_buffer]
+        # example: ['int64', [4], <memory at 0x7fac468dc100>]
+        dtype = getattr(torch, offsets[0])
+        shape = offsets[1]
+        memory_buffer = offsets[2]
+        
+        return torch.frombuffer(memory_buffer, dtype=dtype).view(*shape)
+    else:
+        raise TypeError(f"Unsupported type for 'offsets': {type(offsets)}. ")
+
+
+IS_VLLM_OLD = False
+
 if importlib.util.find_spec("vllm") is not None:
+    import vllm
+    IS_VLLM_OLD = parse(vllm.__version__) < parse("0.9.1")
 
     # Allow unsloth dynamic quants to work
     def is_layer_skipped_bnb(prefix: str, llm_int8_skip_modules):
@@ -110,6 +145,7 @@ if importlib.util.find_spec("vllm") is not None:
             qweight = layer.weight
             quant_states = qweight.bnb_quant_state
             offsets = qweight.bnb_shard_offsets
+            offsets = get_offsets_tensor(offsets)
             inference_dtype = quant_states[0].dtype
             bf_x = x.to(inference_dtype) # Originally used bfloat16
 
@@ -155,6 +191,7 @@ if importlib.util.find_spec("vllm") is not None:
             # only load the bitsandbytes module when needed
             original_type = x.dtype
             original_shape = x.shape
+            print(f"From _apply_4bit_weight, we can see that we only apply this at {layer.weight.device = }")
             reshape_after_matmul = False
             if x.ndim > 2:
                 x = x.reshape(-1, x.size(-1))
@@ -163,6 +200,7 @@ if importlib.util.find_spec("vllm") is not None:
             qweight = layer.weight
             quant_states = qweight.bnb_quant_state
             offsets = qweight.bnb_shard_offsets
+            offsets = get_offsets_tensor(offsets)
             inference_dtype = quant_states[0].dtype
             bf_x = x.to(inference_dtype) # Originally used bfloat16
 
@@ -348,7 +386,7 @@ if importlib.util.find_spec("bitsandbytes") is not None:
             # Must use float32 and disable autocasting - vLLM fails!
             # offset = torch.tensor(float(qs_dict["nested_offset"])).to(device)
             with torch.autocast(device_type = "cuda", enabled = False):
-                offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = "cuda")
+                offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = device)
             state2 = cls(
                 absmax=qs_dict["nested_absmax"].to(device),
                 blocksize=qs_dict["nested_blocksize"],
@@ -497,7 +535,11 @@ async def retrieve_bnb_state_and_offsets(llm):
         if is_async:
             # Case 3: Async engine with pipeline parallelism.
             print("Mode: Async, pp_size>1. Using async_call with the underlying sync engine.")
-            results = await async_call(llm.engine.collective_rpc, "get_bnb_quant_state_and_offsets", args=tuple())
+            if IS_VLLM_OLD:
+                results = await async_call(llm.engine.collective_rpc, "get_bnb_quant_state_and_offsets", args=tuple())
+            else:
+                results = await llm.collective_rpc("get_bnb_quant_state_and_offsets", args=tuple())
+
         else:
             # Case 4: Sync engine with pipeline parallelism.
             print("Mode: Sync, pp_size>1. This is not supported.")
@@ -508,23 +550,23 @@ async def retrieve_bnb_state_and_offsets(llm):
     else:
         raise ValueError(f"Invalid pipeline_parallel_size: {pipeline_parallel_size}")
     
-    # Debug: print what we actually got
-    print(f"collective_rpc returned: {type(results)} - {results}")
-    
     # Handle the case where collective_rpc returns a list of results from multiple workers
     if isinstance(results, list):
         # Merge results from all workers
         merged_quant_state = {}
         merged_offsets = {}
+        merged_output_sizes = {}
         
         for worker_result in results:
             if isinstance(worker_result, dict):
                 merged_quant_state.update(worker_result.get("quant_state", {}))
                 merged_offsets.update(worker_result.get("offsets", {}))
+                merged_output_sizes.update(worker_result.get("output_sizes", {}))
         
         return {
             "quant_state": merged_quant_state,
-            "offsets": merged_offsets
+            "offsets": merged_offsets,
+            "output_sizes": merged_output_sizes
         }
     elif isinstance(results, dict):
         # Single worker case
@@ -562,11 +604,16 @@ async def retrieve_gpu_ids_and_all_weights(llm):
             # Case 3: Async engine with pipeline parallelism.
             # The async LLM engine has a synchronous `engine` attribute for these calls.
             # We must run these blocking calls in a thread pool to not block the event loop.
-            print("Mode: Async, pp_size>1. Using async_call with the underlying sync engine.")
-            gpu_ids, all_weights = await asyncio.gather(
-                async_call(llm.engine.collective_rpc, "report_device_id", args=tuple()),
-                async_call(llm.engine.collective_rpc, "get_weight_ipc_handles", args=tuple())
-            )
+            if IS_VLLM_OLD:
+                gpu_ids, all_weights = await asyncio.gather(
+                    async_call(llm.engine.collective_rpc, "report_device_id", args=tuple()),
+                    async_call(llm.engine.collective_rpc, "get_weight_ipc_handles", args=tuple())
+                )
+            else:
+                gpu_ids, all_weights = await asyncio.gather(
+                   llm.collective_rpc("report_device_id", args=tuple()),
+                   llm.collective_rpc("get_weight_ipc_handles", args=tuple())
+                )
         else:
             # Case 4: Sync engine with pipeline parallelism.
             # This is not a supported scenario in vLLM and should raise an error.
@@ -597,10 +644,13 @@ def get_state_dict_from_collective_rpc(gpu_ids, all_weights):
 def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
+    if hasattr(llm, "llm_engine"):
+        llm = llm.llm_engine
     gpu_ids, all_weights = asyncio.run(retrieve_gpu_ids_and_all_weights(llm))
     bnb = asyncio.run(retrieve_bnb_state_and_offsets(llm))
     bnb_state = bnb["quant_state"]
     bnb_offsets = bnb["offsets"]
+    output_sizes = bnb["output_sizes"]
     vllm_state_dict = get_state_dict_from_collective_rpc(gpu_ids, all_weights)
 
     assert(config is not None)
@@ -612,17 +662,18 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     def get_state_dict(prefix, kk, state_dict, proj_name):
         proj = vllm_state_dict.get(f"{proj_name}.base_layer.weight", state_dict.get(f"{proj_name}.weight", None))
         qweight = proj
-        # if hasattr(proj, "output_sizes"):
-        #     dim_offsets = np.cumsum([0] + proj.output_sizes)
-        # else:
-        #     dim_offsets = [0, qweight.shape[0]]
-        # pass
-        dim_offsets = [0, qweight.shape[0]]  # vLLM does not use output_sizes
+        if output_sizes.get(proj_name) is not None or output_sizes.get(proj_name + ".base_layer") is not None:
+            # This is for Unsloth Dynamic
+            dim_offsets = np.cumsum([0] + output_sizes.get(proj_name, output_sizes.get(proj_name + ".base_layer", [0])))
+        else:
+            dim_offsets = [0, qweight.shape[0]]
+        pass
 
         if proj_name in bnb_state:
             # Bitsandbytes quantizations
             quant_states = bnb_state[proj_name]
             offsets = bnb_offsets[proj_name]
+            offsets = get_offsets_tensor(offsets)
             state_dict[prefix + ".weight"] = qweight[offsets[kk] : offsets[kk + 1]]
             quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
             quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
@@ -633,6 +684,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         else:
             # Normal FP16 weights
             qweight.requires_grad_(False) # Disable grad - sometimes vLLM forgets
+            print(f"dim_offsets = {dim_offsets}, kk = {kk}, proj_name = {proj_name}")
             state_dict[prefix + ".weight"] = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
             quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
         pass
@@ -646,45 +698,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
         pass
     pass
 
-
-    # def get_state_dict(prefix, kk, state_dict, proj):
-    #     proj = getattr(proj, "base_layer", proj)
-    #     qweight = proj.weight
-    #     if hasattr(proj, "output_sizes"):
-    #         dim_offsets = np.cumsum([0] + proj.output_sizes)
-    #     else:
-    #         dim_offsets = [0, qweight.shape[0]]
-    #     pass
-
-    #     if hasattr(qweight, "bnb_quant_state"):
-    #         # Bitsandbytes quantizations
-    #         quant_states = qweight.bnb_quant_state
-    #         offsets = qweight.bnb_shard_offsets
-    #         state_dict[prefix + ".weight"] = qweight[offsets[kk] : offsets[kk + 1]]
-    #         quant_state_dict[prefix + ".weight.quant_state"] = quant_states[kk]
-    #         quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
-    #         quant_state = quant_states[kk].as_dict(packed = True)
-    #         for k, v in quant_state.items():
-    #             state_dict[prefix + ".weight." + k] = v
-    #         pass
-    #     else:
-    #         # Normal FP16 weights
-    #         qweight.requires_grad_(False) # Disable grad - sometimes vLLM forgets
-    #         state_dict[prefix + ".weight"] = qweight[dim_offsets[kk] : dim_offsets[kk + 1]]
-    #         quant_state_dict[prefix + ".weight"] = state_dict[prefix + ".weight"]
-    #     pass
-
-    #     # Check bias
-    #     bias = getattr(proj, "bias", None)
-    #     if bias is not None:
-    #         bias.requires_grad_(False) # Disable grad - sometimes vLLM forgets
-    #         state_dict[prefix + ".bias"] = bias[dim_offsets[kk] : dim_offsets[kk + 1]]
-    #         quant_state_dict[prefix + ".bias"] = state_dict[prefix + ".bias"]
-    #     pass
-    # pass
-
     # Embedding
-    print(f"{vllm_state_dict = }")
     embed_tokens = vllm_state_dict.get("model.embed_tokens.base_layer.weight", vllm_state_dict.get("model.embed_tokens.weight", None)).data
 
     # Counteract vLLM padding vocabs for LoRA
@@ -701,8 +715,11 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None):
     else:
         vllm_config = llm.get_vllm_config()
 
-    num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    # THIS IS FOR PER STAGE 
+    # num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
     for kk in range(num_layers):
+        print(f"Unsloth: Parsing layer {kk} of {num_layers} layers")
         proj_name = f"model.layers.{kk}.self_attn.qkv_proj"
         get_state_dict(f"model.layers.{kk}.self_attn.q_proj", 0, state_dict, proj_name)
         get_state_dict(f"model.layers.{kk}.self_attn.k_proj", 1, state_dict, proj_name)
@@ -760,9 +777,23 @@ pass
 
 
 @torch.inference_mode
-def assert_same_state_dict(old_state_dict, new_state_dict):
+def assert_same_state_dict(old_state_dict, new_state_dict, check_device: bool = True):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if state_dict are equivalent
+    with open("compare.txt", "w") as f:
+        f.write("Old state_dict:\n")
+        f.write(str(old_state_dict) + "\n\n")
+        f.write("New state_dict:\n")
+
+        for key, value in old_state_dict.items():
+            f.write(f"Unsloth: Comparing Old key {key} with value {value.shape} and dtype {value.dtype}")
+            f.write("\n")
+            try:
+                f.write(f"Unsloth: Comparing New key {key} with value {new_state_dict[key].shape} and dtype {new_state_dict[key].dtype} and device {new_state_dict[key].device}")
+            except:
+                pass
+            f.write("\n\n")
+        f.write("\n\n")
 
     difference = new_state_dict.keys() ^ old_state_dict.keys()
     difference -= set(("lm_head.weight",))
@@ -772,13 +803,13 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 
     for key in old_state_dict:
         try:
-            torch.testing.assert_close(old_state_dict[key], new_state_dict[key], check_stride = True)
+            torch.testing.assert_close(old_state_dict[key], new_state_dict[key], check_stride = True, check_device=check_device)
         except Exception as error:
             if key == "lm_head.weight":
                 # Maybe tied embeddings?
                 key1 = key if key in old_state_dict else "model.embed_tokens.weight"
                 key2 = key if key in new_state_dict else "model.embed_tokens.weight"
-                torch.testing.assert_close(old_state_dict[key1], new_state_dict[key2], check_stride = True)
+                torch.testing.assert_close(old_state_dict[key1], new_state_dict[key2], check_stride = True, check_device=check_device)
             else:
                 raise RuntimeError(f"[{key}]\n{str(error)}")
         pass
@@ -1829,6 +1860,36 @@ def _test_same_model(model, new_model, input_ids):
     return
 pass
 
+def apply_sync_wrapper_patch(model_instance):
+    if model_instance.vllm_engine.__class__.__name__ != "AsyncLLM":
+        print("Model is not in async mode. No patch needed.")
+        return
+
+    print("Applying synchronous wrapper patch to `fast_generate`...")
+    
+    original_async_generator = model_instance.fast_generate
+    model_instance.fast_generate_async = original_async_generator
+    
+    def fast_generate_sync(self, *args, **kwargs):
+        final_args = args
+        final_kwargs = kwargs.copy()
+
+        # if force_async, use the original async generator
+        if final_kwargs.pop('force_async', False):
+            return self.fast_generate_async(*final_args, **final_kwargs)
+
+        if 'request_id' not in final_kwargs:
+            final_kwargs['request_id'] = str(uuid.uuid4())
+        
+        async def _get_final_result():
+            final_result = None
+            async for result in self.fast_generate_async(*final_args, **final_kwargs):
+                final_result = result
+            return final_result
+
+        return asyncio.run(_get_final_result())
+
+    model_instance.fast_generate = MethodType(fast_generate_sync, model_instance)
 
 @torch.inference_mode
 def _test_get_vllm_state_dict(

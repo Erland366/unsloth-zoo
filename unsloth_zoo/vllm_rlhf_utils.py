@@ -153,18 +153,44 @@ class ColocateWorkerExtension:
             data[name] = reduce_tensor(p.detach())
         return {self.device_uuid: data}
 
-    def get_bnb_quant_state_and_offsets(self):
+    def get_bnb_quant_state_and_offsets(self) -> list:
         results = {}
         quant_state = {}
+        output_sizes = {}
         offsets = {}
         vllm_model = self.model_runner.model
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+        rank = get_tensor_model_parallel_rank()
+
         for name, module in vllm_model.named_modules():
             if hasattr(module, "weight") and hasattr(module.weight, "bnb_quant_state"):
-                # TODO: This saves both the base layer and non base layer version
+                
+                # === START NEW DEEP DEBUGGING BLOCK ===
+                # Let's check a specific layer, like the first down_proj layer, to reduce log spam
+                # We check the .base_layer since that's where the quant_state attribute lives
+                if name == "model.layers.0.mlp.down_proj.base_layer":
+                    qs_dict = module.weight.bnb_quant_state
+                    
+                    print(f"\n\n[Unsloth Deep Debug] Rank {rank}, Layer {name}", flush=True)
+                    print(f"[Unsloth Deep Debug] Type of quant_state: {type(qs_dict)}", flush=True)
+                    
+                    if isinstance(qs_dict, dict):
+                        print(f"[Unsloth Deep Debug] Dictionary Keys: {qs_dict.keys()}", flush=True)
+                        # Also print some important values
+                        print(f"[Unsloth Deep Debug] Blocksize: {qs_dict.get('blocksize')}", flush=True)
+                        print(f"[Unsloth Deep Debug] Quant Type: {qs_dict.get('quant_type')}", flush=True)
+                        print(f"[Unsloth Deep Debug] Dtype: {qs_dict.get('dtype')}", flush=True)
+                    print("[Unsloth Deep Debug] End of block\n\n", flush=True)
+                # === END NEW DEEP DEBUGGING BLOCK ===
+
+                # Original logic continues here
                 quant_state[name] = module.weight.bnb_quant_state
                 offsets[name] = module.weight.bnb_shard_offsets
 
+            elif hasattr(module, "weight") and hasattr(module, "output_sizes"):
+                output_sizes[name] = module.output_sizes
+
         results["quant_state"] = quant_state
         results["offsets"] = offsets
-        print(results)
+        results["output_sizes"] = output_sizes
         return results
