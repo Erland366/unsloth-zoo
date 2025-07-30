@@ -80,7 +80,7 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
             object_list = [None for _ in range(n)]
         # broadcast_object_list auto blocks so no need for barrier
         torch.distributed.broadcast_object_list(object_list, src = 0)
-        torch.cuda.synchronize()
+        torch.distributed.barrier()
         if n == 1: result = object_list[0]
         else: result = object_list
     else:
