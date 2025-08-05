@@ -239,6 +239,9 @@ def get_transformers_model_type(
     model_types = [x.replace("-", "_").lower() for x in model_types]
     # Add splitted modules for eg gemma3_text -> gemma3
     model_types += [x.split("_")[0] for x in model_types]
+    # gpt-oss -> gpt_oss -> [gpt, gpt_oss], but transformers.models.gpt doesn't exist
+    model_types = [x for x in model_types if x != "gpt"]
+    
     model_types = list(dict().fromkeys(model_types))
 
     from transformers import models
@@ -1404,6 +1407,7 @@ def patch_gradient_checkpointing(module, source):
 
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
+    args = re.sub(r"\battention_mask\s*=\s*[^,]+,?\s*", "", args)
 
     replacer = replacer\
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
