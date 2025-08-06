@@ -239,8 +239,7 @@ def get_transformers_model_type(
     model_types = [x.replace("-", "_").lower() for x in model_types]
     # Add splitted modules for eg gemma3_text -> gemma3
     model_types += [x.split("_")[0] for x in model_types]
-    if 'gpt_oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""):
-        model_types = [x for x in model_types if x != "gpt"]
+    model_types = [x for x in model_types if x != "gpt"]
     model_types = list(dict().fromkeys(model_types))
 
     from transformers import models
@@ -1866,8 +1865,6 @@ DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
     "GraniteMoeHybridMoE",
     "GraniteMoeHybridMambaLayer",
-    "GptOssMLP",
-    "GptOssExperts",
 ]
 
 
