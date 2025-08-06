@@ -1410,7 +1410,10 @@ def patch_gradient_checkpointing(module, source):
 
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
-    args = re.sub(r"\battention_mask\s*=\s*[^,]+,?\s*", "causal_mask_mapping[decoder_layer.attention_type],", args)
+    if module == "GptOssModel":
+        # This is edge case where the key is different with the value, hardcoded it for now for
+        # GptOssModel
+        args = re.sub(r"\battention_mask\s*=\s*[^,]+,?\s*", "causal_mask_mapping[decoder_layer.attention_type],", args)
 
     replacer = replacer\
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
