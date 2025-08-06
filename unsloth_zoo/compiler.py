@@ -208,7 +208,7 @@ _patch_functions = [
     "Conv1d", "Conv2d", "Conv3d",
     "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
     "BatchNorm1d", "BatchNorm2d", "BatchNorm3d",
-    "GroupNorm", "RMSNorm", "LayerNorm",
+    "GroupNorm", "RMSNorm", "LayerNorm"
     # "CrossEntropyLoss",
 ]
 
@@ -609,6 +609,9 @@ def create_standalone_class(
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{1,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
+
+    # Remove @check_model_inputs, THIS MAINLY TARGETING GPT-OSS
+    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{1,}\))?", "", source)
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
@@ -1407,7 +1410,7 @@ def patch_gradient_checkpointing(module, source):
 
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
-    args = re.sub(r"\battention_mask\s*=\s*[^,]+,?\s*", "", args)
+    args = re.sub(r"\battention_mask\s*=\s*[^,]+,?\s*", "causal_mask_mapping[decoder_layer.attention_type],", args)
 
     replacer = replacer\
         .replace("LAYER", layer).replace("MODULELIST_ITEM", modulelist_item)\
@@ -2033,7 +2036,8 @@ def unsloth_compile_transformers(
             gradient_checkpointed_modules.append(module)
         elif "scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source:
             scaled_dot_product_attention_modules.append(module)
-        elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
+        elif ("nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source) and "torch.topk" not in source: 
+            # Last checking mainly targeting GptOssTopKRouter
             full_attention_modules.append(module)
     pass
     removal = set(
