@@ -239,9 +239,8 @@ def get_transformers_model_type(
     model_types = [x.replace("-", "_").lower() for x in model_types]
     # Add splitted modules for eg gemma3_text -> gemma3
     model_types += [x.split("_")[0] for x in model_types]
-    # gpt-oss -> gpt_oss -> [gpt, gpt_oss], but transformers.models.gpt doesn't exist
-    model_types = [x for x in model_types if x != "gpt"]
-    
+    if 'gpt_oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+        model_types = [x for x in model_types if x != "gpt"]
     model_types = list(dict().fromkeys(model_types))
 
     from transformers import models
@@ -608,6 +607,7 @@ def create_standalone_class(
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{1,}\))?", "", source)
+    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{1,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
     # Remove @check_model_inputs, THIS MAINLY TARGETING GPT-OSS
@@ -1383,6 +1383,7 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
+    if 'gpt_oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""): return None
 
     # Fix Qwen2 missing None for gradient checkpointing
     for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
@@ -1865,6 +1866,8 @@ DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
     "GraniteMoeHybridMoE",
     "GraniteMoeHybridMambaLayer",
+    "GptOssMLP",
+    "GptOssExperts",
 ]
 
 
