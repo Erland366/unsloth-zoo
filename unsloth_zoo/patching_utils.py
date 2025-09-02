@@ -29,6 +29,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
+from .hf_utils import dtype_from_config, set_dtype_in_config
 
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
@@ -181,7 +182,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # FAILS for Gemma!
         "config.compiled_autograd = False", # New Torch 2.4 feature which can compile backwards passes
         # https://pytorch.org/tutorials/intermediate/compiled_autograd_tutorial.html
-        "config.recompile_limit = 16", # Reduce recompiles to 16 - then will do eager
+        "config.recompile_limit = 32", # Increase recompile amounts to 32 - then will do eager
+        # f"config.fail_on_recompile_limit_hit = {not debug and ignore_errors}", # Ignore recompiles CANNOT be used in tandem with suppress_errors
         "config.allow_unspec_int_on_nn_module = True", # Integers in modules will auto wrap torch.tensor(self.vocab_size)
         f"config.optimize_ddp = {not debug}", # Optimizes DDP, but can error out so disable on debug
         # Captures .item() for eg
@@ -249,20 +251,22 @@ def patch_model_and_tokenizer(
     assert(type(downcast_rope) is bool)
     import gc
 
-    # Fix torch_dtype
+    # Fix dtype
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "config"):
-            if   m.config.torch_dtype ==  "float32": m.config.torch_dtype = torch.float32
-            elif m.config.torch_dtype == "bfloat16": m.config.torch_dtype = torch.bfloat16
-            elif m.config.torch_dtype ==  "float16": m.config.torch_dtype = torch.float16
+            config_dtype = dtype_from_config(m.config)
+            if   config_dtype ==  "float32": set_dtype_in_config(m.config, torch.float32)
+            elif config_dtype == "bfloat16": set_dtype_in_config(m.config, torch.bfloat16)
+            elif config_dtype ==  "float16": set_dtype_in_config(m.config, torch.float16)
         pass
         m = m.model
     pass
     if hasattr(m, "config"):
-        if   m.config.torch_dtype ==  "float32": m.config.torch_dtype = torch.float32
-        elif m.config.torch_dtype == "bfloat16": m.config.torch_dtype = torch.bfloat16
-        elif m.config.torch_dtype ==  "float16": m.config.torch_dtype = torch.float16
+        config_dtype = dtype_from_config(m.config)
+        if   config_dtype ==  "float32": set_dtype_in_config(m.config, torch.float32)
+        elif config_dtype == "bfloat16": set_dtype_in_config(m.config, torch.bfloat16)
+        elif config_dtype ==  "float16": set_dtype_in_config(m.config, torch.float16)
     pass
 
     # Also patch all dtypes - BnB seems to not allocate the correct type?
@@ -280,45 +284,61 @@ def patch_model_and_tokenizer(
     # Get most likely the correct data-type of the model
     if correct_dtype is None:
         try:
-            correct_dtype = _get_dtype(model.config.torch_dtype)
+            correct_dtype = _get_dtype(dtype_from_config(model.config))
         except:
             correct_dtype = model.get_input_embeddings().weight.dtype
     pass
     # If we force float32, we first use bfloat16, then downcast to float16
     if do_forced_float32:
-      correct_dtype = torch.float16
-      for name, module in model.named_modules():
-          if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-              module.to(torch.float16)
-          if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-              module.to(torch.float16)
-          if "lm_head" in name or "embed_tokens" in name:
-              module.to(torch.float16)
-          if "embed_tokens" in name or "patch_embedding" in name:
-              module.to(torch.float16)
-          if "norm" in name:
-              module.to(torch.float16)
-          torch.cuda.empty_cache()
+        correct_dtype = torch.float16
+        for name, module in model.named_modules():
+            if hasattr(module, "_pre_set_compute_dtype"):
+                setted_dtype = module._pre_set_compute_dtype
+            else:
+                setted_dtype = torch.float16
+            if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
+                module.to(setted_dtype)
+            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
+                module.to(setted_dtype)
+            if "lm_head" in name or "embed_tokens" in name:
+                module.to(setted_dtype)
+            if "embed_tokens" in name or "patch_embedding" in name:
+                module.to(setted_dtype)
+            if name.endswith("norm") and hasattr(module, "weight"):
+                module.to(setted_dtype)
+            if "bias" in name:
+                module.to(setted_dtype)
+            torch.cuda.empty_cache()
 
-      # Convert any remaining bfloat16 parameters
-      for name, param in model.named_parameters():
-          if param.dtype == torch.bfloat16:
-              param.data = param.data.to(torch.float16)
+        # Convert any remaining bfloat16 parameters
+        for name, param in model.named_parameters():
+            if hasattr(param, "_pre_set_compute_dtype"):
+                param.data = param.data.to(param._pre_set_compute_dtype)
+            elif param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float16)
 
-      # Also convert buffers (like position embeddings)
-      for name, buffer in model.named_buffers():
-          if buffer.dtype == torch.bfloat16:
-              buffer.data = buffer.data.to(torch.float16)
-      pass
+        # Also convert buffers (like position embeddings)
+        for name, buffer in model.named_buffers():
+            if hasattr(buffer, "_pre_set_compute_dtype"):
+                buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
+            elif buffer.dtype == torch.bfloat16:
+                buffer.data = buffer.data.to(torch.float16)
+        pass
     pass
 
-    # Correct torch_dtype
+    # Upcast ot downcast if explicitly set
+    for name, module in model.named_modules():
+        if hasattr(module, "_pre_set_compute_dtype"):
+            module.to(module._pre_set_compute_dtype)
+    pass
+
+    # Correct dtype
     def __fix_dtype(config):
         if not hasattr(config, "to_dict"): return
         dicts = config.to_dict()
         for key, value in dicts.items():
-            if key == "torch_dtype":
-                setattr(config, "torch_dtype", correct_dtype)
+            if key == "torch_dtype" or key == "dtype":
+                set_dtype_in_config(config, correct_dtype)
             else:
                 __fix_dtype(getattr(config, key))
     m = model
@@ -346,16 +366,21 @@ def patch_model_and_tokenizer(
 
             quant_state = weight.quant_state
 
+            if hasattr(module, "_pre_set_compute_dtype"):
+                setted_dtype = module._pre_set_compute_dtype
+            else:
+                setted_dtype = correct_dtype
+
             if type(quant_state) is list:
                 # BnB seems to have float16 as default!
-                module.weight.quant_state[2] = correct_dtype # Cast to correct dtype
+                module.weight.quant_state[2] = setted_dtype # Cast to correct dtype
             else:
                 # https://github.com/TimDettmers/bitsandbytes/pull/763/files
-                quant_state.dtype = correct_dtype
+                quant_state.dtype = setted_dtype
             pass
 
             if hasattr(module, "compute_dtype"):
-                module.compute_dtype = correct_dtype
+                module.compute_dtype = setted_dtype
         pass
         # Downcast RoPE embedding to correct data type
         if downcast_rope and ((name.endswith("rotary_emb") or hasattr(module, "cos_cached"))):

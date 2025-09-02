@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2025.8.2"
+__version__ = "2025.8.9"
 
 import os
 # Hugging Face Hub faster downloads
@@ -91,3 +91,7 @@ pass
 # Log Unsloth-Zoo Utilities
 os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 del os
+
+from .temporary_patches import (
+    encode_conversations_with_harmony,
+)
