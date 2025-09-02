@@ -26,6 +26,7 @@ from packaging.version import Version
 import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype
+from .hf_utils import dtype_from_config
 import os
 import re
 
@@ -106,7 +107,7 @@ def prepare_model_for_training(
     assert(type(train_lm_head) is bool)
     assert(type(float32_mixed_precision) is bool)
 
-    dtype = _get_dtype(model.config.torch_dtype)
+    dtype = _get_dtype(dtype_from_config(model.config))
     mixed_precision_dtype = torch.float32
     if dtype == torch.float16:
         # We need to upcast to float32
@@ -154,7 +155,8 @@ def prepare_model_for_training(
         # Upcast to float32 if needed
         if requires_grad:
             name = name.replace("base_model", "model", 1)
-            name = re.sub(r'\.(\d+)\.', r'[\1].', name)
+            while re.search(r'\.(\d+)\.', name) is not None:
+                name = re.sub(r'\.(\d+)\.', r'[\1].', name)
             name = name.replace(".weight", "", 1)
             dtype = torch.float32 if upcast else mixed_precision_dtype
             try:
@@ -164,6 +166,18 @@ def prepare_model_for_training(
                 # Maybe model.model
                 exec(f"model.{name}.to({str(dtype)})")
         pass
+
+        if ('norm.' in name or '_layernorm' in name) and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1":
+            try:
+                name = name.replace("base_model", "model", 1)
+                while re.search(r'\.(\d+)\.', name) is not None:
+                    name = re.sub(r'\.(\d+)\.', r'[\1].', name)
+                name = name.replace(".weight", "", 1)
+                # Try original name
+                exec(f"{name}.to({str(torch.float32)})")
+            except:
+                # Maybe model.model
+                exec(f"model.{name}.to({str(torch.float32)})")
     pass
 
     # Gradient checkpointing
@@ -328,7 +342,8 @@ def unsloth_train(trainer):
 
     # Mixed precision scaling
     torch_version = torch.__version__
-    if model.config.torch_dtype == torch.float16:
+    config_dtype = dtype_from_config(model.config)
+    if config_dtype == torch.float16:
         mixed_precision = "fp16"
         mixed_dtype = torch.float16
         # torch.cuda.amp.autocast is deprecated >= 2.4

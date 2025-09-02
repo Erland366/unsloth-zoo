@@ -14,10 +14,13 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
-from .common import *
-from .gemma import *
-from .misc import *
-from .gemma3n import *
-from .gpt_oss import *
-from .pixtral import *
+__all__ = [
+	"UNSLOTH_ENABLE_LOGGING",
+	"logger",
+]
+import logging
+import os
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
+logger = logging.getLogger(__name__)
+if UNSLOTH_ENABLE_LOGGING:
+    logger.setLevel(logging.DEBUG)

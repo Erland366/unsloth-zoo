@@ -379,6 +379,8 @@ def standardize_data_formats(
     aliases_for_system    = ["system",],
     aliases_for_user      = ["user", "human", "input",],
     aliases_for_assistant = ["gpt", "assistant", "output",],
+    batch_size            = 1000,
+    num_proc              = None,
 ):
     """
     Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
@@ -405,10 +407,10 @@ def standardize_data_formats(
     if "conversations" not in column_names:
         return dataset
 
-    convos = dataset[:10]["conversations"]
+    examples = itertools.islice(dataset, 10)
     uniques = collections.defaultdict(list)
-    for convo in convos:
-        for message in convo:
+    for example in examples:
+        for message in example["conversations"]:
             for key, value in message.items():
                 if type(value) is not str:
                     raise RuntimeError("Unsloth: Cannot standardize non text datasets!")
@@ -464,20 +466,34 @@ def standardize_data_formats(
         return { "conversations" : all_convos, }
     pass
 
-    from multiprocessing import cpu_count
-    num_proc = cpu_count()
+    dataset_map_kwargs = {
+        'batched': True,
+        'batch_size': batch_size,
+    }
+
+    if not isinstance(dataset, IterableDataset):
+        from multiprocessing import cpu_count
+        
+        if num_proc is None or type(num_proc) is not int: 
+          num_proc = cpu_count()
+
+        dataset_map_kwargs['num_proc'] = num_proc
+        dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
         _standardize_dataset,
-        batched = True,
-        desc = "Unsloth: Standardizing formats",
-        num_proc = num_proc,
+        **dataset_map_kwargs
     )
 pass
 
 
 from datasets import (Dataset, IterableDataset,)
-from trl.trainer.utils import ConstantLengthDataset
+try:
+    from trl.trainer.utils import ConstantLengthDataset
+except:
+    # TRL 0.20.0 removes ConstantLengthDataset
+    ConstantLengthDataset = None
+
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
@@ -489,7 +505,10 @@ def sft_prepare_dataset(
     dataset_name: str,
 ) -> Union[Dataset, IterableDataset]:
     # All Unsloth Zoo code licensed under LGPLv3
-    if isinstance(dataset, ConstantLengthDataset): return dataset
+    try:
+        if isinstance(dataset, ConstantLengthDataset): return dataset
+    except:
+        pass
 
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
@@ -580,7 +599,11 @@ def sft_prepare_dataset(
         pass
 
         if not isinstance(dataset, IterableDataset):
-            map_kwargs["num_proc"] = getattr(args, "dataset_num_proc", 2)
+            dataset_num_proc = getattr(args, "dataset_num_proc", None)
+            if dataset_num_proc is None:
+                from multiprocessing import cpu_count
+                dataset_num_proc = max(cpu_count()+4, 2)
+            map_kwargs["num_proc"] = dataset_num_proc
         else:
             map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
             
@@ -594,18 +617,22 @@ def sft_prepare_dataset(
         pass
     pass
     if packing:
-        print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
-        return dataset
+        # Try using new packing which works in TRL
+        try:
+            pack_dataset
+        except:
+            print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
+            return dataset
 
         if max_seq_length == 0:
             raise ValueError("When packing is enabled, `max_seq_length` can't be `None`.")
 
         if use_desc: map_kwargs["desc"] = f"Unsloth: Packing {dataset_name} dataset"
-        dataset = dataset.select_columns(used_column_names).map(
-            pack_examples,
-            batched = True,
-            fn_kwargs = {"seq_length": max_seq_length,},
-            **map_kwargs,
+        dataset = pack_dataset(
+            dataset.select_columns(used_column_names),
+            max_seq_length,
+            getattr(args, "packing_strategy", "bfd"),
+            map_kwargs,
         )
     pass
     return dataset

@@ -22,6 +22,16 @@ __all__ = [
 import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
+from .hf_utils import dtype_from_config
+
+
+try:
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+except (ImportError, ModuleNotFoundError):
+    # Provide a fallback or a clear error if the function isn't available
+    # when not using mxfp4.
+    convert_moe_packed_tensors = None
+
 
 MODEL_CARD = \
 """---
@@ -64,6 +74,7 @@ from transformers.modeling_utils import PushToHubMixin
 import json
 import os
 from pathlib import Path
+from typing import Union, List, Optional
 import tempfile
 from peft import PeftModelForCausalLM, PeftModel
 
@@ -346,50 +357,154 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 pass
 
 
+import torch
+import gc
+import time
+
 @torch.inference_mode
-def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name):
+def _merge_and_overwrite_lora(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
-    filename = os.path.join(save_directory, filename)
+    filename_original = os.path.join(save_directory, filename)  # Original file path
     tensors = OrderedDict()
     count = 0
     import psutil
-    import tempfile
     import pickle
-    limit = 700 * 1024 * 1024 # 700MB
-    with safe_open(filename, framework = "pt", device = "cpu") as file:
+    limit = 700 * 1024 * 1024  # 700MB
+
+    # Convert lora_weights to safetensor format
+    converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+        lora_weights, [], model_class_name=model_class_name)
+
+    with safe_open(filename_original, framework="pt", device="cpu") as file:  # Open original file for reading
         safetensor_keys = list(file.keys())
 
-        # Convert LoRA keys to match safetensor format
+        # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
             lora_weights, safetensor_keys, model_class_name=model_class_name)
 
+        # Set to track mxfp4 keys that have already been processed
+        processed_mxfp4_keys = set()
+
         for key in safetensor_keys:
-            W = file.get_tensor(key)
+            if key in processed_mxfp4_keys:
+                continue
+
+            W = None
+            output_key = key
+            action_logged = False
+            # --- START OF MODIFIED LOGIC ---
+
+            # Case 1: Base model is MXFP4 quantized
+            if base_model_is_quantized:
+                if quant_type == "mxfp4":
+                    # This block handles ALL keys from a hybrid MXFP4 file.
+                    if key.endswith("_blocks"):
+                        if convert_moe_packed_tensors is None:
+                            raise ImportError("MXFP4 dequantization is required, but `convert_moe_packed_tensors` could not be imported.")
+                        base_name = key[:-len("_blocks")]
+                        scales_key = base_name + "_scales"
+                        output_key = base_name # Correct naming without .weight
+                        if scales_key not in safetensor_keys:
+                            warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
+                            continue
+                        blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
+                        W = convert_moe_packed_tensors(blocks_tensor, scales_tensor).transpose(1, 2).contiguous()
+                        processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
+
+                        lora_stats = converted_lora_weights.get(base_name, None)
+                        if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                            print(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
+                            count += 1; W = _merge_lora(W, lora_stats, output_key)
+                        else:
+                            print(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                        action_logged = True
+
+                    elif key.endswith("_scales"):
+                        continue
+
+                    else:
+                        # Handle the 16-bit tensors (like attention layers)
+                        # that are present in the same file as the MXFP4 tensors.
+                        W = file.get_tensor(key)
+
+            else: # This is the general case for a purely 16-bit base model.
+                W = file.get_tensor(key)
             # Remove .weight suffix to match LoRA key format
-            lora_key = key[:-len(".weight")] if key.endswith(".weight") else key
+            lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
 
-            if lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                count += 1
-                W = _merge_lora(W, lora_stats, key)
-                if psutil.virtual_memory().available <= limit:
-                    temp_file = tempfile.NamedTemporaryFile(suffix = ".pt")
-                    torch.save(W.to(output_dtype), temp_file, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL)
-                    W = torch.load(temp_file, map_location = "cpu", mmap = True, weights_only = False)
-                else:
-                    W = W.to(device = "cpu", dtype = output_dtype, non_blocking = True)
-            else:
-                if lora_key in converted_lora_weights:
-                    lora_stats_info = converted_lora_weights[lora_key]
-            tensors[key] = W
-        pass
-    pass
+            if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                if not action_logged:
+                    count += 1
+                    W = _merge_lora(W, lora_stats, output_key)  # Assume _merge_lora is defined elsewhere
+                    action_logged=True
 
-    save_file(tensors, filename, metadata = {"format": "pt"})
+            if W is None:
+                continue
+
+            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+                temp_filename = temp_file.name
+                # Save the merged tensor to a unique temp file
+                torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                # Load it back as a memory-mapped object. The OS will manage paging this from disk.
+                W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
+
+                # Clean up the temporary pickle file immediately after mmaping
+            try:
+                os.remove(temp_filename)
+            except OSError:
+                # On Windows, the mmap might keep a handle. The OS will clean it up.
+                pass
+
+
+            tensors[output_key] = W
+
+            # Free up VRAM after each merge
+            torch.cuda.empty_cache()
+
+    # CRITICAL: Force cleanup to release file handles on Windows
+    if os.name == 'nt':
+        gc.collect()
+        time.sleep(0.1)  # Give Windows a moment to release file handles
+
+    # Create a temporary file in the same directory for atomic rename
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
+        temp_filename_safetensors = tmpfile.name
+
+    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
+
+    # Replace the temporary file with the original file
+    try:
+        os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
+    except OSError as e:
+        # If rename fails (e.g., due to permissions), fall back to copy and remove temporary file
+        print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
+        import shutil
+
+        # On Windows, we might still have the file locking issue with copy
+        if os.name == 'nt':
+            # Try a few times with delays
+            for attempt in range(3):
+                try:
+                    shutil.copy2(temp_filename_safetensors, filename_original)
+                    break
+                except PermissionError:
+                    if attempt == 2:  # Last attempt
+                        raise
+                    time.sleep(0.5)
+                    gc.collect()
+        else:
+            shutil.copy2(temp_filename_safetensors, filename_original)
+
+        # Clean up temp file
+        try:
+            os.remove(temp_filename_safetensors)
+        except:
+            pass
+
     return count
 pass
-
 from huggingface_hub import (
     split_state_dict_into_shards_factory,
     get_torch_storage_size,
@@ -453,7 +568,7 @@ def prepare_saving(
         pass
     pass
 
-    if output_dtype is None: output_dtype = _get_dtype(model.config.torch_dtype)
+    if output_dtype is None: output_dtype = _get_dtype(dtype_from_config(model.config))
     assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
     assert(type(torch.bfloat16) is torch.dtype)
     element_size = torch.tensor([], dtype = output_dtype).element_size()
@@ -540,7 +655,7 @@ pass
 
 def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
     if "quantization_config" in config:
         # Remove the quantization_config field
@@ -548,7 +663,7 @@ def _remove_quantization_config(config_path: Path):
     else:
         return
     # Overwrite the config file
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding = "utf-8") as f:
         json.dump(config, f, indent = 4)
     pass
 pass
@@ -581,6 +696,10 @@ def merge_and_overwrite_lora(
     except:
         model_name = model.config._name_or_path
 
+    final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+    if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method== "merged_16bit":
+        raise TypeError("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
+    model_name = final_model_name
     safetensors_list = []
     max_size_in_bytes = 0
     total_size_in_bytes = 0
@@ -605,7 +724,7 @@ def merge_and_overwrite_lora(
         index_path = os.path.join(model_name, "model.safetensors.index.json")
         if os.path.exists(index_path):
             try:
-                with open(index_path, 'r') as f:
+                with open(index_path, 'r', encoding = "utf-8") as f:
                     index_data = json.load(f)
                     # Extract file names from the index if available
                     if "weight_map" in index_data:
@@ -686,10 +805,11 @@ def merge_and_overwrite_lora(
     if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
 
     # --- Handle 4-bit merging first ---
-    if save_method == "merged_4bit":
+    if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
+        base_model = model.base_model if isinstance(model, PeftModel) else model
         print(f"Unsloth: Merging LoRA weights into 4bit model...")
-        if not isinstance(model, PeftModelForCausalLM):
-             raise TypeError("Model must be a PeftModelForCausalLM for 'merged_4bit' save.")
+        if not isinstance(model, PeftModelForCausalLM) and not isinstance(model, PeftModel):
+             raise TypeError("Model must be a PeftModelForCausalLM or PeftModel for 'merged_4bit' save.")
         if not getattr(model.config, "quantization_config", None):
              raise ValueError("Model does not appear to be quantized. Cannot use 'merged_4bit'.")
 
@@ -748,26 +868,31 @@ def merge_and_overwrite_lora(
         upload_items()
 
 
-    # Step 3: Handle original 16-bit shard retrieval (cache/download)
+    # Step 3: Conditional index handling
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
     safe_tensor_index_files = ["model.safetensors.index.json"] if len(safetensors_list) > 1 else []
 
-    # For local models, we'll copy from the local directory instead of cache/download
-    if is_local_path:
-        print(f"Copying safetensors from local directory: {model_name}")
-        os.makedirs(save_directory, exist_ok=True)
+    # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
+    if not (base_model_is_quantized and quant_type == "mxfp4"):
+        if is_local_path:
+            os.makedirs(save_directory, exist_ok=True)
+            # Copy from local
+            if safe_tensor_index_files:
+                local_index_path = os.path.join(model_name, "model.safetensors.index.json")
+                if os.path.exists(local_index_path):
+                    shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+        else:
+            # Download from HF
+            if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
+                snapshot_download(repo_id=model_name, local_dir=save_directory, allow_patterns=["model.safetensors.index.json"])
 
-        # Copy index file if it exists
-        local_index_path = os.path.join(model_name, "model.safetensors.index.json")
-        if os.path.exists(local_index_path):
-            shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
-            print(f"Copied safetensors index file from local model")
+        if push_to_hub and safe_tensor_index_files:
+            upload_items("model.safetensors.index.json")
+        pass
 
-        # We'll handle the actual files in the later loop
-        copied_all_from_cache = True  # Mark as handled to skip download
-
-    elif _hf_cache_dir is not None:
+    # Step 4 : Handle retrieval of original 16-bit shards
+    if not is_local_path and _hf_cache_dir is not None:
         copied_all_from_cache = _try_copy_all_from_cache(
             repo_id=model_name,
             filenames_to_check=safetensors_list,
@@ -775,6 +900,7 @@ def merge_and_overwrite_lora(
             hf_cache_dir=_hf_cache_dir,
             token=token,
         )
+
     if not copied_all_from_cache and not low_disk_space_usage and not is_local_path:
         print(f"Downloading safetensors for {model_name}...")
         snapshot_download(
@@ -782,17 +908,7 @@ def merge_and_overwrite_lora(
             local_dir = save_directory,
             allow_patterns = safe_tensor_index_files + safetensors_list,
         )
-    elif safe_tensor_index_files and not is_local_path:
-        print(f"Downloading safetensors index for {model_name}...")
-        snapshot_download(
-            repo_id = model_name,
-            local_dir = save_directory,
-            allow_patterns = ["model.safetensors.index.json"],
-        )
 
-    # Step 4: Ensure the index file is uploaded for sharded models, regardless of low_disk_space_usage
-    if push_to_hub and len(safetensors_list) > 1 and os.path.exists(os.path.join(save_directory, "model.safetensors.index.json")):
-        upload_items("model.safetensors.index.json")
 
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Merging weights into 16bit"):
@@ -820,6 +936,8 @@ def merge_and_overwrite_lora(
             lora_weights = lora_weights,
             output_dtype = output_dtype,
             model_class_name = find_lora_base_model(model).__class__.__name__,
+            base_model_is_quantized = base_model_is_quantized,
+            quant_type=quant_type,
         )
         torch.cuda.empty_cache()
         if low_disk_space_usage and push_to_hub:
@@ -828,7 +946,28 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # Step 6: Final upload of all shards if not using low disk space mode and pushing
+    # Step 6: Regenerate index ONLY for MXFP4 dequantization
+    if base_model_is_quantized and quant_type == "mxfp4" and len(safetensors_list) > 1:
+        print("Unsloth: Regenerating safetensors index for dequantized MXFP4 model...")
+        weight_map = {}
+
+        for filename in safetensors_list:
+            file_path = os.path.join(save_directory, filename)
+            # Important check for low_disk_space mode where files might be deleted
+            if not os.path.exists(file_path): continue
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    weight_map[key] = filename
+
+        index_data = {"metadata": {}, "weight_map": weight_map}
+        index_path = os.path.join(save_directory, "model.safetensors.index.json")
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=4)
+
+        if push_to_hub:
+            upload_items("model.safetensors.index.json")
+
+    # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
 
         # Explicitly upload all safetensors files if not already handled
@@ -863,10 +1002,10 @@ pass
 
 def _try_copy_all_from_cache(
     repo_id: str,
-    filenames_to_check: list[str],
+    filenames_to_check: List[str],
     target_dir_str: str, # Expect string path for target directory
-    hf_cache_dir: Path | None,
-    token: str | None,
+    hf_cache_dir: Optional[Path],
+    token: Optional[str],
 ) -> bool:
     """
     Checks if ALL specified files exist in the HF cache. If yes, creates the
@@ -930,7 +1069,7 @@ def _try_copy_all_from_cache(
         return False
 pass
 
-def _copy_file_from_source(src_path: str | Path, target_dir_str: str, filename: str):
+def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, filename: str):
     """Copies a file from src_path to target_dir_str/filename using os.path."""
     src_path = Path(src_path) # Keep Path for source checking ease
     dst_path = os.path.join(target_dir_str, filename) # Use os.path.join for destination
@@ -946,7 +1085,7 @@ def _copy_file_from_source(src_path: str | Path, target_dir_str: str, filename: 
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
 
-def _get_hf_cache_dir() -> Path | None:
+def _get_hf_cache_dir() -> Optional[Path]:
     """Determines the Hugging Face Hub cache directory."""
     potential_paths = []
     if "HF_HUB_CACHE" in os.environ:
@@ -1246,7 +1385,7 @@ def get_original_model_id(local_path: str):
 
     config_path = os.path.join(local_path, "config.json")
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding = "utf-8") as f:
             config = json.load(f)
 
         # Check for _name_or_path that's not a local path
@@ -1256,7 +1395,7 @@ def get_original_model_id(local_path: str):
 
     config_path = os.path.join(local_path, "adapter_config.json")
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding = "utf-8") as f:
             config = json.load(f)
 
         if "base_model_name_or_path" in config:
@@ -1381,6 +1520,109 @@ def find_lora_base_model(model_to_inspect):
     if hasattr(current, "model"):
         current = current.model
     return current
+pass
+
+def check_hf_model_exists(model_name, token=None):
+    """Check if model exists on HuggingFace"""
+    try:
+        file_list = HfFileSystem(token=token).ls(model_name, detail=True)
+        return any(x["name"].endswith(".safetensors") for x in file_list)
+    except:
+        return False
+pass
+
+def check_local_model_exists(model_path):
+    """Check if model exists locally"""
+    return os.path.exists(model_path) and os.path.isdir(model_path)
+pass
+
+def check_model_quantization_status(model_name_or_path, token=None):
+    """Check if a model is quantized (works for both HF and local)"""
+    config = None
+    # Local path
+    if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
+        config_path = os.path.join(model_name_or_path, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding="utf-8") as f:
+                    config = json.load(f)
+            except:
+                pass
+    # HF repo
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            config_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="config.json",
+                cache_dir=None,
+                token=token
+            )
+            with open(config_path, 'r', encoding="utf-8") as f:
+                config = json.load(f)
+        except:
+            pass
+
+    if config and "quantization_config" in config:
+        quant_config = config["quantization_config"]
+
+        # Case 2: Check for MXFP4 format first (more specific)
+        # We assume the Mxfp4Config serializes with a "quant_method": "mxfp4" key.
+        if isinstance(quant_config, dict) and quant_config.get("quant_method") == "mxfp4":
+            return (True, "mxfp4")
+
+        # Case 1: Fallback to existing logic for bitsandbytes
+        elif isinstance(quant_config, dict):
+            is_quantized = quant_config.get("load_in_4bit", False)
+            quant_type = quant_config.get("bnb_4bit_quant_type", None)
+            if is_quantized:
+                # Return the specific type if available, otherwise a generic "bitsandbytes"
+                return (True, quant_type if quant_type else "bitsandbytes")
+
+    return (False, None)
+pass
+
+def determine_base_model_source(model_name, token=None):
+    """
+    Determine the best source for base model using branched logic
+    Returns: (final_model_name, is_local_path, source_info, is_quantized, quant_type)
+    """
+
+    # Check availability
+    hf_exists = check_hf_model_exists(model_name, token)
+    local_exists = check_local_model_exists(model_name)
+
+    # Branch A: HF model exists
+    if hf_exists:
+        hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
+
+        if not hf_is_quantized:
+            # A1: HF unquantized exists → use HF
+            return (model_name, False, "HF_unquantized", False, None)
+        else:
+            # A2: HF is quantized, check if local unquantized exists
+            if local_exists:
+                local_is_quantized, local_quant_type = check_model_quantization_status(model_name)
+                if not local_is_quantized:
+                    # A2a: Local unquantized exists → use local
+                    return (model_name, True, "local_unquantized_preferred_over_HF_quantized", False, None)
+                else:
+                    # A2b: Both quantized → use HF (more reliable)
+                    return (model_name, False, "HF_quantized", True, hf_quant_type)
+            else:
+                # A3: Only HF quantized exists
+                return (model_name, False, "HF_quantized_only", True, hf_quant_type)
+
+    # Branch B: HF model doesn't exist
+    else:
+        if local_exists:
+            # B1: Any local exists → use local
+            local_is_quantized, local_quant_type = check_model_quantization_status(model_name)
+            status = "quantized" if local_is_quantized else "unquantized"
+            return (model_name, True, f"local_{status}_only", local_is_quantized, local_quant_type)
+        else:
+            # B2: Nothing found
+            raise ValueError(f"Model {model_name} not found locally or on HuggingFace")
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
