@@ -53,8 +53,18 @@ if DEVICE_TYPE == "cuda":
     else:
         HAS_CUT_CROSS_ENTROPY = False
     pass
+elif DEVICE_TYPE == "hip":
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "xpu":
-    HAS_CUT_CROSS_ENTROPY = False
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 else:
     pass
 pass
@@ -160,7 +170,7 @@ def post_patch_loss_function(model):
 pass
 
 
-torch_cuda_device = torch.cuda.device
+current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -178,7 +188,7 @@ def fused_linear_cross_entropy(
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
-    with torch_cuda_device(lm_weight.device):
+    with current_device(lm_weight.device):
         loss = linear_cross_entropy(
             hidden_states.to(lm_weight.dtype),
             lm_weight,
@@ -241,6 +251,19 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
+# Check for DataParallel
+#
+# DataParallel uses scatter and gather
+# cpu->0 scatter 0 --> 0 gather 0
+# cpu->0 scatter 1 --> 1 gather 0
+# cpu->0 scatter 2 --> 2 gather 0
+#
+# DistributedDataParallel is faster and launches multiple processes
+# cpu->0 ------------> 0 gather 0
+# cpu->1 ------------> 1 gather 0
+# cpu->2 ------------> 2 gather 0
+from transformers.training_args import ParallelMode
+
 # Cannot use sadly
 # import torch._dynamo.eval_frame as torch_dynamo_eval_frame
 # torch_compiler_set_stance = torch.compiler.set_stance
@@ -248,7 +271,6 @@ TRAINING_ITERATIONS = 0
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
-# global final_batches
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -302,11 +324,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    # global final_batches
-    # final_batches = batch_samples
-    # if "RAISE_ATTENTION_MASK" in os.environ:
-    #     raise
-
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
@@ -333,8 +350,13 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-            if device is not None and torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(device)
+            if torch.is_tensor(num_items_in_batch):
+                if device is not None:
+                    num_items_in_batch = num_items_in_batch.to(device)
+                if getattr(self.args, "n_gpu", 1) > 1 and self.args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
+                    # Uses DataParallel scatter gather
+                    # So we have to scatter num_items_in_batch to each GPU
+                    num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
         except Exception as exception:
             raise RuntimeError(exception)
     pass

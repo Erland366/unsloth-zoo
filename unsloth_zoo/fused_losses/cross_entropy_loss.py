@@ -26,6 +26,7 @@ import inspect
 import functools
 import math
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth import DEVICE_TYPE
 
 @functools.cache
 def _get_mapping(autograd):
@@ -108,14 +109,21 @@ pass
 
 
 @functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = 1):
+def _get_chunk_multiplier(vocab_size, target_gb = None):
     """ Gets chunk size that fits the target max memory usage (1GB) """
+    if target_gb is None:
+        # Find current VRAM left in the GPU, and use 50% or less of it
+        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu"  else torch.cuda.mem_get_info(0)
+        free_gb = free / 1024 / 1024 / 1024
+        free_gb = free_gb * 0.5
+        target_gb = free_gb
+    pass
     multiplier = (vocab_size * 4 / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = 1):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
     """ Gets chunk size that fits the target max memory usage (1GB) """
     multiplier = _get_chunk_multiplier(vocab_size, target_gb)
     n_splits = (bsz*qlen) * multiplier
@@ -137,7 +145,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         n_items        : Optional[torch.Tensor] = None,
         scaling        : Optional[float] = None,
         shift_labels   : Optional[bool] = True,
-        target_gb      : Optional[int] = 1,
+        target_gb      : Optional[int] = None,
         torch_compile  : Optional[bool] = True,
         overwrite      : Optional[bool] = False,
         extra_kwargs   : Optional[Dict] = None,
@@ -147,7 +155,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         * If n_items is not given, does mean(loss), otherwise sum(loss)/n_items
         * shift_labels does hidden_states[..., :-1] and labels[..., 1:]
         * Allows scaling factor from mixed precision fp16, fp8
-        * target_gb specifies the max GB memory the fused loss can use - default 1GB
+        * target_gb specifies the max GB memory the fused loss can use - default detects VRAM left
         * overwrite allows hidden_states to be overwritten with gradients
         * Place extra args in extra_kwargs which will be passed to (loss_function)
         """
@@ -170,6 +178,8 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         # N items divisor
         divisor = n_items if n_items is not None else (labels != -100).sum()
+        # Counteract DataParallel having multiple items since it does scatter & gather
+        if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = divisor.to(dtype = torch.float32, device = device)
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
@@ -329,7 +339,7 @@ def unsloth_fused_ce_loss(
     mask           : Optional[torch.Tensor] = None,
     n_items        : Optional[torch.Tensor] = None,
     scaling        : Optional[float] = None,
-    target_gb      : Optional[int] = 1,
+    target_gb      : Optional[int] = None,
     torch_compile  : Optional[bool] = True,
     overwrite      : Optional[bool] = False,
     **kwargs,
@@ -339,7 +349,7 @@ def unsloth_fused_ce_loss(
     * If n_items is not given, does mean(ce_loss), otherwise sum(ce_loss)/n_items
     * Auto does shift of labels ie hidden_states[..., :-1] and labels[..., 1:]
     * Allows scaling factor from mixed precision fp16, fp8
-    * target_gb specifies the max GB memory the fused loss can use - default 1GB
+    * target_gb specifies the max GB memory the fused loss can use - default detects VRAM left
     * Upcasts to float32 and allows kwargs to have:
     1) logit_scale_multiply (X = X * logit_scale_multiply)
     2) logit_scale_divide   (X = X / logit_scale_divide)

@@ -29,7 +29,7 @@ __all__ = [
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
 from .utils import _get_dtype, Version
-from .hf_utils import dtype_from_config, set_dtype_in_config
+from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
 # Also disable compiling on bitsandbytes
 def patch_compiling_bitsandbytes():
@@ -103,7 +103,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
             recompiles_verbose = True,
             compiled_autograd_verbose = False, # Produces too much code
             aot_joint_graph = False, # Produces too much code
-            aot_graphs = False,  # Produces too much code
+            aot_graphs = False, # Produces too much code
             perf_hints = True, # Performance improvement hints
         )
         torch._dynamo.config.verbose = True
@@ -166,10 +166,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
-        # when setting to not debug aka True, we get errors on torch2.6 
+        # when setting to not debug aka True, we get errors on torch2.6
         # TypeError: ValueRangeAnalysis.to_dtype() got an unexpected keyword argument 'use_compute_types'
         # this keyword exists in torch2.7.0 but not in torch2.6.0 so set to False until torch2.6.0 is deprecated.
-        "config.emulate_precision_casts = False", # Force X.to(f32).to(f16) instead of X.to(f16)
     ]
     # Torch dynamo arguments
     torch_dynamo_arguments = [
@@ -217,7 +216,9 @@ def get_model(model):
             break
         elif hasattr(x, "model"):
             x = x.model
-        elif hasattr(x, "base_model"):
+        elif hasattr(x, "base_model") and x.base_model !=x:
+            # for VLMs x.base_model = x causing this to be stuck in endless loop
+            # the check x.base_model != x is to prevent this
             x = x.base_model
         elif hasattr(x, "language_model"):
             x = x.language_model
@@ -237,6 +238,33 @@ def verify_and_set_device(module,):
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
     module._per_layer_device_index = device.index
+pass
+
+def patch_to_dict():
+    from functools import wraps
+    from transformers.configuration_utils import PretrainedConfig
+    from .hf_utils import _normalize_dict_dtypes
+    original_to_dict = PretrainedConfig.to_dict
+    original_to_diff_dict = PretrainedConfig.to_diff_dict
+
+    @wraps(original_to_dict)
+    def wrapped_to_dict(self, *args, **kwargs):
+        result = original_to_dict(self, *args, **kwargs)
+        return _normalize_dict_dtypes(result)
+    
+    @wraps(original_to_diff_dict)
+    def wrapped_to_diff_dict(self, *args, **kwargs):
+        result = original_to_diff_dict(self, *args, **kwargs)
+        return _normalize_dict_dtypes(result)
+    
+    wrapped_to_diff_dict._unsloth_patched = True
+    if not getattr(PretrainedConfig, "_unsloth_patched", False):
+        setattr(PretrainedConfig, "to_diff_dict", wrapped_to_diff_dict)
+    pass
+
+    wrapped_to_dict._unsloth_patched = True
+    if not getattr(PretrainedConfig, "_unsloth_patched", False):
+        setattr(PretrainedConfig, "to_dict", wrapped_to_dict)
 pass
 
 def patch_model_and_tokenizer(
@@ -338,7 +366,7 @@ def patch_model_and_tokenizer(
         dicts = config.to_dict()
         for key, value in dicts.items():
             if key == "torch_dtype" or key == "dtype":
-                set_dtype_in_config(config, correct_dtype)
+                setattr(config, key, correct_dtype)
             else:
                 __fix_dtype(getattr(config, key))
     m = model
@@ -354,6 +382,13 @@ def patch_model_and_tokenizer(
         try: setattr(m, "dtype", correct_dtype)
         except: pass
     pass
+
+    # since we are now setting actual dtypes in config
+    # and there is a transition from torch.dtype to dtype
+    # support for auto dtype conversion is not stable
+    # patch to dict makes sure that any torch.dtype is converted to
+    # string when trying to save the config or serialize it
+    patch_to_dict()
 
     # Check all params and patch!
     for name, module in model.named_modules():
@@ -402,9 +437,14 @@ def patch_model_and_tokenizer(
 
     if not fix_embeddings: return model, tokenizer
 
-    # Torch.compile fails on embedding matrix??
-    try: old_input_embedding = model.get_input_embeddings ().weight
-    except: return model, tokenizer
+    # Check if torch.nn.Embedding seen
+    is_torch_embedding = False
+    try:
+        old_input_embedding = model.get_input_embeddings()
+        is_torch_embedding  = type(old_input_embedding) is torch.nn.Embedding
+        old_input_embedding = old_input_embedding.weight
+    except:
+        return model, tokenizer
 
     # Maybe not all models have a lm_head?
     try: old_output_embedding = model.get_output_embeddings().weight
@@ -415,7 +455,7 @@ def patch_model_and_tokenizer(
         or (model.config.tie_word_embeddings)
 
     # Check pad token's id -> we need to expand the embedding
-    if tokenizer is not None and len(tokenizer) > old_input_embedding.shape[0]:
+    if is_torch_embedding and (tokenizer is not None) and (len(tokenizer) > old_input_embedding.shape[0]):
         # Workaround randomnly fixes it for torch versions < 2.
         requires_grad = old_input_embedding.requires_grad
         old_input_embedding.requires_grad_(False)
@@ -436,12 +476,14 @@ def patch_model_and_tokenizer(
         pass
     pass
 
-    model.set_input_embeddings(
-        torch.nn.Embedding.from_pretrained(
-            old_input_embedding,
-            padding_idx = getattr(model.config, "pad_token_id", None),
+    if is_torch_embedding:
+        model.set_input_embeddings(
+            torch.nn.Embedding.from_pretrained(
+                old_input_embedding,
+                padding_idx = getattr(model.config, "pad_token_id", None),
+            )
         )
-    )
+    pass
 
     # We also do this for the lm_head
     if old_output_embedding.numel() != 0:

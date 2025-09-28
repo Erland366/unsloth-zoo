@@ -16,6 +16,7 @@
 
 __all__ = [
     "patch_function",
+    "patch_function_past_key_values",
     "process_return",
     "process_output_options",
     "KWARGS_TYPE",
@@ -33,11 +34,13 @@ __all__ = [
     "ProcessingKwargs",
     "ProcessorMixin",
     "_get_unique_storage_name",
+    "dedent",
 ]
 import inspect
 import typing as t
 import torch
-from typing import Any, Callable, Dict, List, Tuple
+from textwrap import dedent
+from typing import Any, Callable, Dict, List, Tuple, Union
 try:
     t_TypedDictMeta = t._TypedDictMeta
 except:
@@ -48,13 +51,13 @@ from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compi
 
 EMPTY = inspect._empty
 
-def raise_error(f: str, exception: Any):
+def raise_error(f: str, exception: Any = None):
     # Raises error only if logging is on
     if UNSLOTH_ENABLE_LOGGING:
         logger.error(
             f"==================\n"\
             f"Failed to patch {f}. Error\n"\
-            f"{str(exception)}\n"\
+            f"{str(exception) if exception is not None else ''}\n"\
             f"==================\n"
         )
     return
@@ -109,7 +112,11 @@ except ImportError as e:
     e = str(e)
     if "cannot import name '_center' from 'numpy._core.umath'" in e:
         raise RuntimeError(
-            f"You might have used uv to install packages, and they broke numpy. Try restarting your runtime."
+            f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
+        )
+    elif "torchvision::nms does not exist" in e:
+        raise RuntimeError(
+            f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
         )
     elif "Unpack" not in e:
         raise Exception(e)
@@ -236,7 +243,8 @@ try: from transformers.processing_utils import ProcessorMixin
 except: pass
 
 # Normalize common built-in types to their typing equivalents
-VAR_KEYWORD_ID = inspect.Parameter.VAR_KEYWORD.value
+VAR_KEYWORD_ID    = inspect.Parameter.VAR_KEYWORD.value
+VAR_POSITIONAL_ID = inspect.Parameter.VAR_POSITIONAL.value
 TYPE_MAPPINGS = {
     torch.Tensor         : torch.Tensor,
     torch.IntTensor      : torch.Tensor,
@@ -265,6 +273,12 @@ if TransformersKwargs   != t_TypedDictMeta: TYPE_MAPPINGS[TransformersKwargs]   
 if FlashAttentionKwargs != t_TypedDictMeta: TYPE_MAPPINGS[FlashAttentionKwargs] = t_TypedDictMeta
 if LossKwargs           != t_TypedDictMeta: TYPE_MAPPINGS[LossKwargs]           = t_TypedDictMeta
 
+try:
+    import types
+    TYPE_MAPPINGS[types.UnionType] = t.Union
+except:
+    pass
+
 def _canonicalize_annotation(annotation: Any) -> Any:
     """
     Canonicalize type annotations for consistent comparison.
@@ -288,7 +302,11 @@ def canonicalize_annotation(annotation: Any) -> Any:
         # Union[str, List[str], list[str]] gets reduced to Union[str, list[str]]
         # due to duplicates. We also sort Unions
         if annotation[0] == t.Union:
-            annotation = (annotation[0], tuple(set(annotation[1])),)
+            args = list(set(annotation[1]))
+            # We must sort by str(x) since set is NOT ordered
+            args.sort(key = lambda x: str(x))
+            args = tuple(args)
+            annotation = (annotation[0], args,)
         # Fix up kwargs
         # (typing.Unpack, (<class 'transformers.models.csm.modeling_csm.KwargsForCausalLM'>,)) to
         # (typing.Unpack, (<class 'typing._TypedDictMeta'>,))
@@ -383,15 +401,62 @@ def can_safely_patch(
     except ValueError as e:
         return False, f"Signature inspection failed: {e}"
 
+    # If relaxed, allow matching with *args, **kwargs
+    def check_args_kwargs(old_fp, new_fp, removed_flags_list):
+        if (len(new_fp) >= 2) and (
+            new_fp[-1]["kind"] == VAR_KEYWORD_ID and new_fp[-1]["name"] == "kwargs"
+        ) and (
+            new_fp[-2]["kind"] == VAR_POSITIONAL_ID and new_fp[-2]["name"] == "args"
+        ):
+            # Check removed flags must not have any gaps!
+            removed_flags_list = set(removed_flags_list)
+            removed_flags_list -= set({"args", "kwargs"})
+            i = 0
+            fail = False
+            while i < len(old_fp):
+                old_arg = old_fp[i]
+                if old_arg["name"] in removed_flags_list:
+                    # Go to the end
+                    i += 1
+                    while i < len(old_fp):
+                        old_arg = old_fp[i]
+                        if old_arg["name"] not in removed_flags_list:
+                            # Hole seen but ignore args, kwargs
+                            if (old_arg["name"] in ("args", "kwargs",)) and \
+                                (old_arg["kind"] in (VAR_KEYWORD_ID, VAR_POSITIONAL_ID,)):
+                                pass
+                            else:
+                                fail = True
+                                break
+                        i += 1
+                i += 1
+            if not fail:
+                return True, f"Replacing with *args, **kwargs"
+        return False, ""
+    pass
+
+
     if len(old_fp) != len(new_fp):
         # New transformers 4.54.0 removed output_attentions and output_hidden_states
         # We check it and ignore if the old function has both these, and the new removed them
-        if removed_flags(old_fp, new_fp) == ("output_attentions", "output_hidden_states",):
+        removed_flags_list = removed_flags(old_fp, new_fp)
+        if removed_flags_list == ("output_attentions", "output_hidden_states",):
             return False, f"New function removed output_attentions and output_hidden_states"
+        result, error = check_args_kwargs(old_fp, new_fp, removed_flags_list)
+        if result == True:
+            return True, error
         return False, f"Parameter count mismatch: {len(old_fp)} vs {len(new_fp)}"
+    pass
 
+    # Go through function one by one
     for old_param, new_param in zip(old_fp, new_fp):
         if (old_param['name'], old_param['kind']) != (new_param['name'], new_param['kind']):
+            if match_level == "relaxed":
+                # Check one last time for *args, **kwargs replacement
+                removed_flags_list = removed_flags(old_fp, new_fp)
+                result, error = check_args_kwargs(old_fp, new_fp, removed_flags_list)
+                if result == True:
+                    return True, error
             return False, f"Parameter '{old_param['name']}' signature changed"
 
         if new_param['is_required'] and not old_param['is_required']:
@@ -491,6 +556,60 @@ def patch_function(
             logger.error(f"Unsloth: Failed to patch {target_obj.__name__}.{attr_name}: {e}")
         return False
     pass
+pass
+
+
+def patch_function_past_key_values(
+    target_obj: Any,
+    attr_name: str,
+    new_functions: Union[Callable, List[Callable]], 
+    force: bool = False,
+    store_original: bool = True, 
+    match_level: str = "strict",
+    fullgraph = None,
+    dynamic = True,
+) -> bool:
+    """ Patch either past_key_value or past_key_values """
+    if not hasattr(target_obj, attr_name):
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.error(f"Unsloth: Attribute '{attr_name}' not found on {target_obj.__name__}")
+        return False
+
+    original_func = getattr(target_obj, attr_name)
+    try:
+        old_keys = inspect.signature(original_func).parameters.keys()
+    except:
+        logger.error(f"Unsloth: Cannot inspect {target_obj.__name__}")
+        return False
+    success = False
+    error = ""
+    for func in new_functions:
+        try:
+            new_keys = inspect.signature(func).parameters.keys()
+        except Exception as e:
+            error = str(e)
+            continue
+        # Check if either is provided
+        for key in ("past_key_value", "past_key_values",):
+            if key in new_keys and key in old_keys:
+                try:
+                    success = patch_function(
+                        target_obj = target_obj,
+                        attr_name = attr_name,
+                        new_func = func, 
+                        force = force,
+                        store_original = store_original,
+                        match_level = match_level,
+                        fullgraph = fullgraph,
+                        dynamic = dynamic,
+                    )
+                    if success: break
+                except Exception as e:
+                    error = str(e)
+                    continue
+    if not success and UNSLOTH_ENABLE_LOGGING:
+        logger.error(f"Unsloth: Failed to patch {target_obj.__name__}.{attr_name}: {error}")
+    return success
 pass
 
 
